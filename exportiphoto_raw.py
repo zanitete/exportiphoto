@@ -47,14 +47,12 @@ class RemoveNullsStream(IOBase):
 
 class iPhotoLibrary(object):
     def __init__(self, albumDir, destDir, use_album=False, use_date=False,
-                 use_faces=False, use_metadata=False, deconflict=False, quiet=False,
+                 use_faces=False, quiet=False,
                  year_dir=False, import_missing=False, import_from_date=None, test=False,
                  date_delimiter="-", ignore_time_delta=False, originals=False):
         self.use_album = use_album
         self.use_date =  use_date
         self.use_faces = use_faces
-        self.use_metadata = use_metadata
-        self.deconflict = deconflict
         self.dest_dir = destDir
         self.output_dirs = set()
         self.output_files = set()
@@ -239,59 +237,32 @@ class iPhotoLibrary(object):
          - folderDate is the date of the folder, and
          - imageId is the string identifier for the image.
         """
-        if self.use_album:
-            targetName = "AlbumName"
-            albums = [a for a in self.albums if
-                      a.get("Album Type", None) == "Regular"]
-        else:
-            targetName = "RollName"
-            albums = self.albums
+        albums = [a for a in self.albums if
+                  a.get("Album Type", None) == "Regular"]
         i = 0
         for folder in albums:
             i += 1
-            if self.use_album:
-                folderDate = None
-            else:
-                folderDate = self.appleDate(folder["RollDateAsTimerInterval"])
+
+            # skip "Last Import" fake album
+            if folder["GUID"] == "lastImportAlbum":
+                self.status("* Skip album 'Last Import'\n")
+                continue
+
+            folderName = folder["AlbumName"]
+            folderDate = None
             images = folder["KeyList"]
 
-            folderName = folder[targetName]
-
-            #as we process albums/events in the iPhoto library, remove that album
-            #from the list of import_albums we'll be importing at the end
-            if self.import_albums:
-                for ia in self.import_albums:
-                    for album_name in ia['album_names']:
-                        album_name = unicode(album_name, 'utf-8')
-                        if folderName == album_name:
-                            self.import_albums.remove(ia)
-
-            if folderDate and self.use_date:
-                date = '%(year)d%(delim)s%(month)02d%(delim)s%(day)02d' % {
-                    'year': folderDate.year,
-                    'month': folderDate.month,
-                    'day': folderDate.day,
-                    'delim': self.date_delimiter
-                }
-                if re.match("[A-Z][a-z]{2} [0-9]{1,2}, [0-9]{4}", folderName):
-                    outputPath = date
-                elif re.match("[0-9]{4}.[0-9]{2}.[0-9]{2} ?.*", folderName):
-                    outputPath = folderName
-                else:
-                    outputPath = date + " " + folderName
-                if self.year_dir:
-                    outputPath = os.path.join(str(folderDate.year), outputPath)
-            else:
-                outputPath = folderName
+            outputPath = folderName
 
             # Deconflict output directories
+            # if there're 2 albumns with the same name in the library,
+            # it will create album_1, album_2, ...
             targetFileDir = os.path.join(self.dest_dir, outputPath)
-            if self.deconflict:
-                j = 1
-                while targetFileDir in self.output_dirs:
-                    targetFileDir = os.path.join(self.dest_dir, outputPath + " %02d"%j)
-                    j += 1
-                self.output_dirs.add(targetFileDir)
+            j = 1
+            while targetFileDir in self.output_dirs:
+                targetFileDir = os.path.join(self.dest_dir, outputPath + " %02d"%j)
+                j += 1
+            self.output_dirs.add(targetFileDir)
 
             self.status("* Processing %i of %i: %s (%i images)...\n" % (
                 i,
@@ -304,30 +275,11 @@ class iPhotoLibrary(object):
                     func(imageId, targetFileDir, folderDate)
             self.status("\n")
 
-        if self.import_missing: 
-            self.status("importing folders:\n")
-            for ia in self.import_albums:
-                self.status(ia["album_dir"] + "\n")
-
-                #using the "Auto Import" dir in iPhoto was unpredictable with respect to the resulting event name.
-                #Using AppleScript to import the event, seams to always result in the event being properly named
-                if not self.test:
-                    #There is probably a better way to do this. I noticed I had an album with an ' in it that errored...
-                    escaped_dir = ia["album_dir"].replace("'", "\\'").replace('"', '\\"')
-                    os.system('''osascript -e '
-tell application "iPhoto"
-    import from "%s"
-end tell
-' ''' % escaped_dir)
-
     def copyImage(self, imageId, folderName, folderDate):
         """
         Copy an image from the library to a folder in the dest_dir. The
         name of the folder is based on folderName and folderDate; if
         folderDate is None, it's only based upon the folderName.
-
-        If use_metadata is True, also write the image metadata from the library
-        to the copy. If use_faces is True, faces will be saved as keywords.
         """
         try:
             image = self.images[imageId]
@@ -346,105 +298,75 @@ end tell
         #Unedited images only have ImagePath, edited images have both ImagePath and OriginalPath,
         #except for some corrupted iPhoto libraries, where some images only have OriginalPath.
         #Trying to satisfy both conditions with this nested logic.
-        if self.originals:
-            if "OriginalPath" in image:
-                mFilePath = image["OriginalPath"]
-            else:
-                mFilePath = image["ImagePath"]
+        mRawFilePath = None
+        if not "ImagePath" in image:
+            # this should never occur for not corrupted libraries
+            mFilePath = image["OriginalPath"]
         else:
-            if not "ImagePath" in image:
-                mFilePath = image["OriginalPath"]
-            else:
-                mFilePath = image["ImagePath"]
+            mFilePath = image["ImagePath"]
+            #se orginal e' raw (CR2), copia entrambe, original in folder RAW
+            if "OriginalPath" in image and image["OriginalPath"].lower().endswith(".cr2"):
+                mRawFilePath = image["OriginalPath"]
+
         basename = os.path.basename(mFilePath)
+        tFilePath = os.path.join(folderName, basename)
+
+        if mRawFilePath:
+            rawBasename = os.path.basename(mRawFilePath)
+            tRawFilePath = os.path.join(folderName, "raw", rawBasename)
 
         # Deconflict ouput filenames
-        tFilePath = os.path.join(folderName, basename)
-        if self.deconflict:
-            j = 1
-            while tFilePath in self.output_files:
-                tFilePath = os.path.join(folderName, "%02d_"%j + basename)
-                j += 1
-            self.output_files.add(tFilePath)
+        # 2 files in the same album w/ the same name? improbabile ma...
+        j = 1
+        while tFilePath in self.output_files:
+            tFilePath = os.path.join(folderName, "%02d_"%j + basename)
+            j += 1
+        self.output_files.add(tFilePath)
 
-        # Skip unchanged files, unless we're writing metadata.
-        if not self.use_metadata and os.path.exists(tFilePath):
+        #  comput final target file (and check if it already exists)
+        tFilePath = self.getTargetFilePath(mFilePath, tFilePath);
+
+        # tFilePath is None if the file exists
+        if tFilePath:
+            if not self.test:
+                if os.path.exists(mFilePath):
+                    shutil.copy2(mFilePath, tFilePath)
+                if mRawFilePath and os.path.exists(mRawFilePath):
+                    tRawDir = os.path.dirname(tRawFilePath)
+                    if not os.path.exists(tRawDir):
+                        os.makedirs(tRawDir)
+                    shutil.copy2(mRawFilePath, tRawFilePath)
+            self.status(".")
+        else:
+            self.status("-")
+
+    def getTargetFilePath(self, mFilePath, tFilePath):
+        '''
+        return:
+            - None if the target file already exists and it's identical.
+            - the target file path if:
+                - the file already exists and it's different (add incremental numeber to the filename)
+                - the file doesn't exist yet
+        '''
+        if os.path.exists(tFilePath):
             mStat = os.stat(mFilePath)
             tStat = os.stat(tFilePath)
 
-            if not self.ignore_time_delta and abs(tStat[stat.ST_MTIME] - mStat[stat.ST_MTIME]) <= 10:
-                self.status("-")
-                return
-
             if tStat[stat.ST_SIZE] == mStat[stat.ST_SIZE]:
-                self.status("-")
-                return
-
-        if not self.test and os.path.exists(mFilePath):
-            shutil.copy2(mFilePath, tFilePath)
-        md_written = False
-        if self.use_metadata:
-            md_written = self.writePhotoMD(imageId, tFilePath)
-        if md_written:
-            self.status("+")
-        else:
-            self.status(".")
-
-    def writePhotoMD(self, imageId, filePath=None):
-        """
-        Write the metadata from the library for imageId to filePath.
-        If filePath is None, write it to the photo in the library.
-        If use_faces is True, iPhoto face names will be written to
-        keywords.
-        """
-        try:
-            image = self.images[imageId]
-        except KeyError:
-            raise iPhotoLibraryError, "Can't find image #%s" % imageId
-
-        if not filePath:
-            if self.originals:
-                if "OriginalPath" in image:
-                    mFilePath = image["OriginalPath"]
-                else:
-                    mFilePath = image["ImagePath"]
+                # the file is the same
+                return None
             else:
-                if not "ImagePath" in image:
-                    mFilePath = image["OriginalPath"]
+                fileName, fileExtension = os.path.splitext(tFilePath)
+                match = re.match(r'^(.*)_v([0-9]{0,2}$)', fileName)
+                if match:
+                    fileName = match.group(1)
+                    counter = int(match.group(2)) + 1
                 else:
-                    mFilePath = image["ImagePath"]
-
-
-        caption = image.get("Caption", None)
-        rating = image.get("Rating", None)
-        comment = image.get("Comment", None)
-        keywords = set([self.keywords[k] for k in image.get("Keywords", [])])
-        if self.use_faces:
-            keywords.update([self.faces[f['face key']]
-                             for f in image.get("Faces", [])
-                             if self.faces.has_key(f['face key'])]
-            )
-
-        if caption or comment or rating or keywords:
-            try:
-                md = pyexiv2.ImageMetadata(filePath)
-                md.read()
-                if caption:
-                    md["Iptc.Application2.Headline"] = [caption]
-                if rating:
-                    md["Xmp.xmp.Rating"] = rating
-                if comment:
-                    md["Iptc.Application2.Caption"] = [comment]
-                if keywords:
-                    md["Iptc.Application2.Keywords"] = list(keywords)
-                if not self.test:
-                    md.write(preserve_timestamps=True)
-                return True
-            except IOError, why:
-                self.status("\nProblem setting metadata (%s) on %s\n" % (
-                    unicode(why.__str__(), errors='replace'), filePath
-                ))
-        return False
+                    counter = 1
+                newFile = "%s_v%d%s" % (fileName, counter, fileExtension)
+                return self.getTargetFilePath(mFilePath, newFile)
+        else:
+            return tFilePath
 
     def appleDate(self, text):
         try:
@@ -523,18 +445,7 @@ if __name__ == '__main__':
     option_parser = OptionParser(usage=usage, version=version)
     option_parser.set_defaults(
         test=False,
-        albums=False,
-        metadata=False,
-        faces=False,
-        quiet=False,
-        date=True,
-        ignore_time_delta=False,
-        originals=False
-    )
-
-    option_parser.add_option("-a", "--albums",
-                             action="store_true", dest="albums",
-                             help="use albums instead of events"
+        quiet=False
     )
 
     option_parser.add_option("-q", "--quiet",
@@ -542,61 +453,10 @@ if __name__ == '__main__':
                              help="use quiet mode"
     )
 
-    option_parser.add_option("-d", "--date",
-                             action="store_false", dest="date",
-                             help="stop use date prefix in folder name"
-    )
-    
-    option_parser.add_option("-o", "--originals",
-                             action="store_true", dest="originals",
-                             help="export original images instead of edited ones"
-    )
-
-    option_parser.add_option("-x", "--deconflict",
-                             action="store_true", dest="deconflict",
-                             help="deconflict export directories of same name"
-    )
-
     option_parser.add_option("-t", "--test",
                              action="store_true", dest="test",
                              help="don't actually copy files or import folders"
     )
-
-    option_parser.add_option("-y", "--yeardir",
-                             action="store_true", dest="year_dir",
-                             help="add year directory to output"
-    )
-
-    option_parser.add_option("-e", "--date_delimiter",
-                             action="store", type="string", dest="date_delimiter",
-                             help="date delimiter default=%s" % default_date_delimiter
-    )
-
-    option_parser.add_option("-i", "--import",
-                             action="store_true", dest="import_missing",
-                             help="import missing albums from dest directory"
-    )
-
-    option_parser.add_option("-j", "--ignore_time_delta",
-                             action="store_true", dest="ignore_time_delta",
-                             help="ignore time delta when determining whether or not to copy a file"
-    )
-
-    option_parser.add_option("-z", "--import_from_date",
-                             action="store", type="string", dest="import_from_date",
-                             help="only import missing folers if folder date occurs after (YYYY-MM-DD). Uses date in folder name."
-    )
-
-    if pyexiv2:
-        option_parser.add_option("-m", "--metadata",
-                                 action="store_true", dest="metadata",
-                                 help="write metadata to images"
-        )
-
-        option_parser.add_option("-f", "--faces",
-                                 action="store_true", dest="faces",
-                                 help="store faces as keywords (requires -m)"
-        )
 
     (options, args) = option_parser.parse_args()
 
@@ -606,24 +466,11 @@ if __name__ == '__main__':
         )
 
     try:
-        if options.date_delimiter is None:
-            options.date_delimiter = default_date_delimiter
-        
         library = iPhotoLibrary(args[0], # src
                                 args[1], # dest
-                                use_album=options.albums,
-                                use_date=options.date,
-                                use_faces=options.faces,
-                                use_metadata=options.metadata,
-                                deconflict=options.deconflict,
+                                use_album=True,
                                 quiet=options.quiet,
-                                year_dir=options.year_dir,
-                                import_missing=options.import_missing,
-                                import_from_date=options.import_from_date,
-                                test=options.test,
-                                date_delimiter=options.date_delimiter,
-                                ignore_time_delta=options.ignore_time_delta,
-                                originals=options.originals
+                                test=options.test
                                 )
         def copyImage(imageId, folderName, folderDate):
             library.copyImage(imageId, folderName, folderDate)
